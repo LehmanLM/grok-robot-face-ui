@@ -1,4 +1,4 @@
-# grok-rot-robot-face-ui
+# grok-robot-face-ui
 
 Grok Bot 桌面宠物表情的 C 移植，运行于 **RK3566 / Linux fbdev**，LVGL 9 只作为画布宿主。
 
