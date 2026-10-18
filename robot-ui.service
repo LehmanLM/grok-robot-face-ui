@@ -1,0 +1,18 @@
+[Unit]
+Description=Robot assistant LVGL UI on /dev/fb0
+# 注意：本单元被 multi-user.target 拉起，绝不能 After=multi-user.target
+# （排序循环 → systemd 丢弃启动任务，板上 inactive+无日志的铁证）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 横屏方向：90 默认（与游戏机 GAME_UI_ROT=90 同款）；倒过来改 270
+Environment=ROBOT_UI_ROT=90
+ExecStartPre=/bin/sh -c "for v in /sys/class/vtconsole/vtcon*; do if grep -q 'frame buffer' $v/name 2>/dev/null; then echo 0 > $v/bind; fi; done"
+ExecStopPost=/bin/sh -c "for v in /sys/class/vtconsole/vtcon*; do if grep -q 'frame buffer' $v/name 2>/dev/null; then echo 1 > $v/bind; fi; done"
+ExecStart=/usr/bin/robot-ui --fb /dev/fb0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

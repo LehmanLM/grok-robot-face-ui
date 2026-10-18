@@ -1,0 +1,5 @@
+vendor-geometry-data.js
+grok_face_data.h
+*.o
+*.d
+robot-ui

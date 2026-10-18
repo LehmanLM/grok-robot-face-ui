@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>表情引擎实现原理 — 机器人助手 Robot-UI</title>
+<style>
+:root{
+  --bg:#101418; --card:#1a212b; --line:#2c3745;
+  --text:#e8eef5; --dim:#8b97a6;
+  --orange:#ff9e2c; --orange-deep:#c2752a;
+  --blue:#2f9dff; --violet:#9d7bff; --green:#18b77a;
+  --mono:"JetBrains Mono","Cascadia Code",Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif;
+  line-height:1.75;overflow-x:hidden;
+}
+.wrap{max-width:980px;margin:0 auto;padding:0 26px}
+
+.hero{
+  padding:64px 0 36px;text-align:center;position:relative;
+  background:
+    radial-gradient(ellipse 55% 45% at 50% -8%, rgba(255,158,44,.12), transparent),
+    radial-gradient(ellipse 35% 35% at 88% 18%, rgba(157,123,255,.06), transparent);
+}
+.hero h1{font-size:32px;font-weight:700;letter-spacing:1px}
+.hero h1 em{color:var(--orange);font-style:normal}
+.hero p.sub{color:var(--dim);margin-top:8px;font-size:14.5px}
+.hero .chips{margin-top:16px;display:flex;gap:9px;justify-content:center;flex-wrap:wrap}
+.hero .chips span{
+  font-size:12px;color:var(--dim);border:1px solid var(--line);
+  padding:3px 11px;border-radius:99px;background:var(--card);
+}
+
+/* ---- 互动区 ---- */
+.lab{
+  margin:26px auto 0;width:fit-content;display:flex;flex-direction:column;align-items:center;gap:6px;
+}
+#face{cursor:pointer;transition:transform .12s}
+#face:active{transform:scale(.95)}
+.lab .tip{color:var(--dim);font-size:12.5px}
+.controls{
+  display:flex;gap:26px;margin-top:10px;flex-wrap:wrap;justify-content:center;
+}
+.ctl{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:12px;color:var(--dim)}
+.ctl b{font-family:var(--mono);color:var(--orange);font-size:12.5px}
+.ctl input[type=range]{width:170px;accent-color:var(--orange)}
+.readout{
+  margin-top:10px;font-family:var(--mono);font-size:11.5px;color:var(--dim);
+  background:var(--card);border:1px solid var(--line);border-radius:8px;
+  padding:4px 14px;
+}
+.readout b{color:var(--orange);font-weight:400}
+
+section{padding:42px 0 8px}
+.sec-head{display:flex;align-items:baseline;gap:13px;margin-bottom:20px}
+.sec-head .no{
+  font-family:var(--mono);color:var(--orange);font-size:13px;
+  border:1px solid rgba(255,158,44,.4);border-radius:8px;padding:2px 8px;
+}
+.sec-head h2{font-size:21px;font-weight:650}
+.sec-head .en{color:var(--dim);font-size:11.5px;font-family:var(--mono)}
+
+/* ---- 解剖图 ---- */
+.anatomy{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}
+.a-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.a-card h3{font-size:14px;margin-bottom:6px;display:flex;gap:8px;align-items:center}
+.a-card h3 .k{
+  font-family:var(--mono);font-size:10.5px;color:var(--bg);background:var(--orange);
+  border-radius:5px;padding:0 7px;font-weight:700;
+}
+.a-card p{font-size:12.5px;color:var(--dim)}
+.a-card p code, .stage p code, .feat p code{
+  font-family:var(--mono);font-size:11.5px;color:var(--orange);
+  background:rgba(255,158,44,.08);border:1px solid rgba(255,158,44,.2);
+  border-radius:5px;padding:0 5px;
+}
+
+/* ---- 流水线 ---- */
+.pipe{display:flex;flex-direction:column;align-items:center}
+.stage{
+  width:min(720px,100%);background:var(--card);border:1px solid var(--line);
+  border-radius:14px;padding:15px 22px;position:relative;
+}
+.stage .tag{
+  position:absolute;top:-11px;left:20px;font-family:var(--mono);font-size:11px;
+  color:var(--bg);background:var(--orange);border-radius:6px;padding:1px 9px;font-weight:700;
+}
+.stage:nth-of-type(4) .tag{background:var(--violet)}
+.stage:nth-of-type(6) .tag{background:var(--green)}
+.stage:nth-of-type(8) .tag{background:var(--blue)}
+.stage h3{font-size:14px;margin:2px 0 5px}
+.stage p{font-size:12.5px;color:var(--dim)}
+.vlink{height:30px;width:2px;background:var(--line);position:relative;margin:2px 0}
+.vlink::after{
+  content:"";position:absolute;bottom:-1px;left:-4px;
+  border-top:8px solid var(--line);border-left:5px solid transparent;border-right:5px solid transparent;
+}
+
+/* ---- 表格 ---- */
+table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500;font-size:11.5px;font-family:var(--mono)}
+td b{color:var(--orange);font-weight:600}
+td{color:var(--dim)} td:first-child{color:var(--text)}
+.tbl-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:8px 6px;overflow-x:auto}
+
+/* ---- 数据链 ---- */
+.chain{display:flex;align-items:center;flex-wrap:wrap;justify-content:center;gap:0}
+.chain .cnode{
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:10px 16px;font-size:12.5px;text-align:center;
+}
+.chain .cnode b{display:block;font-size:13px;margin-bottom:2px}
+.chain .cnode small{color:var(--dim);font-size:11px}
+.chain .carrow{width:40px;height:2px;background:var(--line);position:relative;margin:0 2px;flex-shrink:0}
+.chain .carrow::after{
+  content:"";position:absolute;right:-1px;top:-4px;
+  border-left:8px solid var(--line);border-top:5px solid transparent;border-bottom:5px solid transparent;
+}
+
+/* ---- 要点 ---- */
+.feats{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
+.feat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 19px}
+.feat h3{font-size:13.5px;margin-bottom:6px;display:flex;gap:8px;align-items:center}
+.feat h3 .ic{
+  font-family:var(--mono);font-size:10.5px;color:var(--orange);
+  border:1px solid rgba(255,158,44,.35);border-radius:6px;padding:0 7px;
+}
+.feat p{font-size:12.5px;color:var(--dim)}
+.feat a{color:var(--orange);text-decoration:none;border-bottom:1px dashed rgba(255,158,44,.4)}
+.feat a:hover{border-bottom-style:solid}
+
+footer{margin-top:52px;padding:24px 0 38px;border-top:1px solid var(--line);
+  text-align:center;color:var(--dim);font-size:12px;font-family:var(--mono)}
+
+@media (max-width:640px){ .hero h1{font-size:24px} .ctl input[type=range]{width:130px} }
+</style>
+</head>
+<body>
+
+<div class="hero wrap">
+  <h1>表情是怎么<em>画</em>出来的</h1>
+  <p class="sub">机器人助手 Robot-UI · Grok Bot 表情的 C 移植：弹簧姿态引擎 + 软件光栅（LVGL 只当画布宿主）</p>
+  <div class="chips">
+    <span>C · 无第三方依赖</span><span>16 弹簧积分</span><span>193 点 blob · 25 组眼睛</span>
+    <span>2× 超采样 AA</span><span>33ms 一帧</span>
+  </div>
+
+  <div class="lab">
+    <canvas id="face" width="320" height="320"></canvas>
+    <div class="tip">↑ 点它 = 转一圈 · 鼠标移入 = 视线跟随 · 下面两个滑杆调的是「弹簧性格」</div>
+    <div class="controls">
+      <div class="ctl">频率 freq（刚度）<b id="fv">6.2</b>
+        <input id="freq" type="range" min="2" max="14" step="0.1" value="6.2"></div>
+      <div class="ctl">阻尼 damp（干脆程度）<b id="dv">1.0</b>
+        <input id="damp" type="range" min="0.3" max="2.2" step="0.05" value="1.0"></div>
+    </div>
+    <div class="readout">spin = <b id="ro">0.000</b> rad &nbsp;·&nbsp; squash = <b id="rs">1.000</b></div>
+  </div>
+</div>
+
+<div class="wrap">
+
+<!-- ============ 01 解剖 ============ -->
+<section>
+  <div class="sec-head"><span class="no">01</span><h2>一张脸只有两个元素</h2><span class="en">BLOB + EYE HOLES</span></div>
+  <div class="anatomy">
+    <div class="a-card">
+      <h3><span class="k">BLOB</span>身体 = 193 点多边形</h3>
+      <p>一个近似圆的封闭多边形（顶点数据烘焙在 <code>grok_face_data.h</code>）。
+      每帧被「平移 → 旋转 → 挤压」三变换摆出姿态 —— 挤压(squash)是弹性感的全部来源：
+      横向变宽时纵向等比变窄，面积守恒。</p>
+    </div>
+    <div class="a-card">
+      <h3><span class="k">HOLE</span>眼睛 = 镂空</h3>
+      <p>眼睛不是"画上去的白块"，而是从身体上<b style="color:var(--text)">挖掉的洞</b>——
+      直接露出页面背景色。25 组 48 顶点眼形多边形按 3D 矩阵投影摆放，
+      所以换眼形、眨眼、视线偏移都只是换一组顶点坐标。</p>
+    </div>
+    <div class="a-card">
+      <h3><span class="k">INK</span>墨水 = 垂直渐变</h3>
+      <p>填充色是顶亮底暗的橙渐变（<code>#FF9E2C → ×0.76</code>），模拟受光。
+      画布清屏色 = 页面底色 <code>#101418</code>，且无边框 —— 脸"悬浮"在界面里，看不出画布边界。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 流水线 ============ -->
+<section>
+  <div class="sec-head"><span class="no">02</span><h2>一帧的流水线</h2><span class="en">33ms · VENDOR → CANVAS → FB</span></div>
+  <div class="pipe">
+    <div class="stage">
+      <span class="tag">1 · POSE</span>
+      <h3>姿态弹簧层</h3>
+      <p>16 个弹簧同时积分：squash / spin / tx / ty / blink / eyeScale / morph…
+      加上眨眼队列（14% 概率双眨）、视线游走、idle 16 形轮播（3~5s 随机换形，16% 转圈 / 18% 粒子 / 24% 轻声点缀）。
+      此阶段所有几何量都在 <code>vendor 坐标系</code>（中心 ≈115、半径 ≈114）里算。</p>
+    </div>
+    <div class="vlink"></div>
+    <div class="stage">
+      <span class="tag">2 · TRANSFORM</span>
+      <h3>视口变换 gf_view_to_ss()</h3>
+      <p><code>canvas = (v − 114.27) × VIEW_K + 200</code>，<code>VIEW_K = (400−28)/230</code>
+      —— 脸直径 372 钉满画布、中心钉在画布中心。坐标再 ×2 进入 800×800 超采样空间。
+      想让脸更大？改一个宏，整条链自动跟着缩放（FX 半径同样由 VIEW_K 派生）。</p>
+    </div>
+    <div class="vlink"></div>
+    <div class="stage">
+      <span class="tag">3 · RASTER</span>
+      <h3>软件光栅（不走 LVGL 绘制管线）</h3>
+      <p>多边形扫描线填充进 coverage 位图：身体 <code>set=1</code>、眼睛 <code>set=0</code>（挖洞）；
+      listen 呼吸环等 overlay 直接同缓冲直画。降采样 2×2 coverage 做 AA，
+      按覆盖率把橙墨水混进底色，写入 ARGB 像素缓冲 <code>expr_buf</code>。</p>
+    </div>
+    <div class="vlink"></div>
+    <div class="stage">
+      <span class="tag">4 · PRESENT</span>
+      <h3>LVGL 画布 → 屏幕</h3>
+      <p>缓冲挂 <code>lv_canvas</code>，invalidate 后由 LVGL flush 做旋转 blit
+      （fbdev 物理竖向 480×800 → 逻辑横向 800×480），写入 <code>/dev/fb0</code>。
+      LVGL 全程只做"搬运"，不参与表情数学。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 03 弹簧 ============ -->
+<section>
+  <div class="sec-head"><span class="no">03</span><h2>为什么是弹簧，不是补间动画</h2><span class="en">x″ = (target−x)·f² − 2ζ√f·x′</span></div>
+  <div class="tbl-card">
+    <table>
+      <tr><th>动作</th><th>弹簧参数 [freq, damp]</th><th>手感</th></tr>
+      <tr><td>转一圈 spinTurn</td><td><b>[6.2, 1.0]</b> 目标 ±2π</td><td>干脆的整圈旋转，到位即停</td></tr>
+      <tr><td>换形 morph</td><td><b>[9, 1.0]</b> 切 16 眼形</td><td>快速弹过去，眼形"啪"地切换</td></tr>
+      <tr><td>眨眼 blink</td><td>目标先压 0.05 再回 1</td><td>下落快、回升带一点回弹</td></tr>
+      <tr><td>呼吸 squash</td><td>正弦驱动 ±3.5%</td><td>待机时一直"活着"的微动</td></tr>
+    </table>
+  </div>
+  <p style="color:var(--dim);font-size:12.5px;margin-top:10px">
+    所有动作都是同一套二阶弹簧积分的连续量 —— 没有关键帧表、没有缓动函数库。
+    参数表还原自原版 Grok Bot 表情（geometry 归 xAI，个人学习用途），
+    改一个数字就能调"性格"：顶上的滑杆就是 Live 实验。
+  </p>
+</section>
+
+<!-- ============ 04 状态映射 ============ -->
+<section>
+  <div class="sec-head"><span class="no">04</span><h2>状态 → 表情</h2><span class="en">MOOD MAP</span></div>
+  <div class="tbl-card">
+    <table>
+      <tr><th>语音状态</th><th>表情</th><th>额外效果</th></tr>
+      <tr><td>待机 idle</td><td>16 形轮播 · 呼吸</td><td>换形时随机：转圈/粒子/轻声/彩蛋音</td></tr>
+      <tr><td>唤醒 wake</td><td>弹起 + 睁大</td><td>转一圈 + boing 音效</td></tr>
+      <tr><td>聆听 listen</td><td>呼吸环（半径 = GROK_RE×VIEW_K 派生）</td><td>环随音量节律扩散</td></tr>
+      <tr><td>思考 think</td><td>眼形上扬 · 静止</td><td>状态徽章旁 270° 弧 spinner（<code>&lt;360° 才看得出转</code>）</td></tr>
+      <tr><td>播报 speak</td><td>笑眼 + 弹跳</td><td>粒子爆发 + sparkle 音效</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 05 数据链 ============ -->
+<section>
+  <div class="sec-head"><span class="no">05</span><h2>几何数据从哪来</h2><span class="en">BAKED AT BUILD TIME</span></div>
+  <div class="chain">
+    <div class="cnode"><b>Grok Bot.app</b><small>xAI 原版表情</small></div>
+    <div class="carrow"></div>
+    <div class="cnode"><b>vendor-geometry-data.js</b><small>193 点 blob · 25 组眼形 · 3D 矩阵</small></div>
+    <div class="carrow"></div>
+    <div class="cnode"><b>gen_grok_face.py</b><small>提取 → 生成 C 数组</small></div>
+    <div class="carrow"></div>
+    <div class="cnode"><b>grok_face_data.h</b><small>编译期烘焙 · 运行时零解析</small></div>
+  </div>
+</section>
+
+<!-- ============ 06 要点 ============ -->
+<section>
+  <div class="sec-head"><span class="no">06</span><h2>几个反直觉的决定</h2><span class="en">WHY</span></div>
+  <div class="feats">
+    <div class="feat"><h3><span class="ic">why</span>不用 LVGL 画脸</h3>
+      <p>任意多边形挖洞 + 逐像素墨水渐变 + 2×AA，widget 管线表达不了；
+      直接写 ARGB 缓冲的光栅实现反而最简单，LVGL 只提供画布与上屏。</p></div>
+    <div class="feat"><h3><span class="ic">why</span>几何留在 vendor 坐标系</h3>
+      <p>数学层与分辨率彻底解耦：VIEW_K 一个缩放系数决定脸多大，
+      换画布尺寸（300→340→400）引擎代码零改动 —— 只踩过一次 overlay 半径忘了派生的坑。</p></div>
+    <div class="feat"><h3><span class="ic">why</span>编译期烘焙数据</h3>
+      <p>193+25×48 个顶点做成 const 数组进 .rodata：无文件 IO、无解析器、
+      无内存分配，冷启动即渲染，也方便 md5 锁定版本。</p></div>
+    <div class="feat"><h3><span class="ic">why</span>清屏色 = 页面底色</h3>
+      <p>画布自带深色背景 + 边框时会看出"一块贴上去的屏幕区域"。
+      让引擎清屏色与页面完全一致并去掉边框，脸才真正"长"在界面里。</p></div>
+  </div>
+</section>
+
+<!-- ============ 07 参考 ============ -->
+<section>
+  <div class="sec-head"><span class="no">07</span><h2>参考与数据来源</h2><span class="en">REFERENCES</span></div>
+  <div class="feats">
+    <div class="feat">
+      <h3><span class="ic">geo</span>表情几何：Grok Bot（xAI）</h3>
+      <p>几何/参数提取自 xAI <b>Grok Bot.app</b> v0.18.0 桌面宠物，经研究仓
+      <a href="https://github.com/blessonism/grok-icon-study" target="_blank">github.com/blessonism/grok-icon-study</a>
+      整理的 <code>vendor-geometry-data.js</code>。
+      <b style="color:var(--orange)">素材版权归 xAI 所有，此处仅个人学习研究用途</b>，商用/分发需自行评估。</p>
+    </div>
+    <div class="feat">
+      <h3><span class="ic">ui</span>LVGL 9（MIT）</h3>
+      <p>画布宿主 / 控件 / fbdev flush：
+      <a href="https://lvgl.io" target="_blank">lvgl.io</a> ·
+      <a href="https://github.com/lvgl/lvgl" target="_blank">github.com/lvgl/lvgl</a>。
+      表情引擎本体不依赖它，仅上屏链路使用。</p>
+    </div>
+    <div class="feat">
+      <h3><span class="ic">sfx</span>待机音效：Kenney（CC0）</h3>
+      <p>blip / swoosh / sparkle / boing：
+      <a href="https://kenney.nl/assets/interface-sounds" target="_blank">kenney.nl/assets/interface-sounds</a> ·
+      <a href="https://kenney.nl/assets/digital-audio" target="_blank">digital-audio</a>，
+      CC0 可自由使用与分发。</p>
+    </div>
+    <div class="feat">
+      <h3><span class="ic">sfx</span>彩蛋音效：Mixkit（免费许可）</h3>
+      <p>meow / bark / spring：
+      <a href="https://mixkit.co/free-sound-effects/" target="_blank">mixkit.co/free-sound-effects</a>
+      （免费许可允许随作品使用，条款见官网）。</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  robot-ui 表情引擎 · Grok Bot 的 C 移植 · 33ms/帧 · RK3566
+</footer>
+
+</div>
+
+<script>
+/* ---------- 可玩版迷你引擎：弹簧 freq/damp 可调，复刻 spinTurn 手感 ---------- */
+(function(){
+  const cv = document.getElementById('face'), ctx = cv.getContext('2d');
+  const W = 320, C = 160, R = 118, BG = '#101418';
+  let mx = 0, my = 0;
+  let FREQ = 6.2, DAMP = 1.0;
+  let sqX = 1, sqV = 0;
+  let spX = 0, spV = 0, spinTarget = 0;
+  let blink = 1, blinkV = 0, blinkT = 0, nextBlink = 1.4;
+  let t0 = performance.now(), last = t0;
+
+  const fr = document.getElementById('freq'), dp = document.getElementById('damp');
+  const fv = document.getElementById('fv'), dv = document.getElementById('dv');
+  const ro = document.getElementById('ro'), rs = document.getElementById('rs');
+  fr.oninput = ()=>{ FREQ = +fr.value; fv.textContent = FREQ.toFixed(1); };
+  dp.oninput = ()=>{ DAMP = +dp.value; dv.textContent = DAMP.toFixed(2); };
+
+  function spring(x, v, target, mult, dt){
+    const f = FREQ * mult, d = 2 * DAMP * Math.sqrt(f);
+    const a = (target - x) * f - d * v;
+    v += a * dt; x += v * dt; return [x, v];
+  }
+  cv.addEventListener('mousemove', e=>{
+    const r = cv.getBoundingClientRect();
+    mx = Math.max(-1, Math.min(1, (e.clientX - r.left - r.width/2) / (r.width/2)));
+    my = Math.max(-1, Math.min(1, (e.clientY - r.top - r.height/2) / (r.height/2)));
+  });
+  cv.addEventListener('mouseleave', ()=>{ mx = 0; my = 0; });
+  cv.addEventListener('click', ()=>{
+    spinTarget += Math.PI * 2;
+    sqV -= 2.2;                              // 顺手压一下 squash
+  });
+
+  function frame(now){
+    const dt = Math.min(0.033, (now - last)/1000); last = now;
+    const t = (now - t0)/1000;
+
+    [sqX, sqV] = spring(sqX, sqV, 1 + 0.035*Math.sin(t*2.1), 1, dt);
+    [spX, spV] = spring(spX, spV, spinTarget, 1, dt);
+    blinkT += dt;
+    if (blinkT > nextBlink){ blinkT = 0; nextBlink = 1.2 + Math.random()*3.2; blinkV = -9; }
+    [blink, blinkV] = spring(blink, blinkV, 1, 0.55, dt);   // 眨眼用更软的刚度
+    blink = Math.max(0.03, blink);
+
+    ro.textContent = spX.toFixed(3);
+    rs.textContent = sqX.toFixed(3);
+
+    ctx.clearRect(0,0,W,W);
+    ctx.save();
+    ctx.translate(C, C + Math.sin(t*2.1)*2.5);
+    ctx.rotate(spX);
+    ctx.scale(1/Math.sqrt(Math.max(.2,sqX)), Math.max(.2,sqX));
+
+    const g = ctx.createLinearGradient(0,-R,0,R);
+    g.addColorStop(0,'#ffa53a'); g.addColorStop(1,'#c2752a');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, R, R, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.globalCompositeOperation = 'destination-out';
+    const ex = 46, ey = -14, rx = 14, ry = 28;
+    const gx = mx*10, gy = my*8, bl = Math.max(0.06, blink);
+    ctx.beginPath();
+    ctx.ellipse(-ex+gx, ey+gy, rx, ry*bl, 0, 0, Math.PI*2);
+    ctx.ellipse( ex+gx, ey+gy, rx, ry*bl, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
