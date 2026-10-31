@@ -14,7 +14,8 @@
  *             user <text>     (ASR result)
  *             robot <text>    (reply being spoken)
  *           (va/board_main.py writes these events)
- *   cam   — camera preview (v4l2 capture placeholder in this version)
+ *   cam   — camera live preview (rkisp selfpath 640x480 NV12; needs one
+ *           params buffer queued on /dev/video9 to bring the ISP up)
  *
  * The service unbinds fbcon before start so printk cannot scribble over
  * the UI; console output stays on the serial port.
@@ -24,6 +25,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +33,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <termios.h>
@@ -279,11 +282,13 @@ static void home_build(void)
 
 /* ============ shared top bar with back ============ */
 static void voice_engine(int on);   /* 语音页门控（定义在 voice 段） */
+static void cam_stop(void);         /* 相机页门控（定义在 cam 段） */
 
 static void back_to_home(lv_event_t *e)
 {
     (void)e;
-    voice_engine(0);   /* 退回首页即停语音链（stop 已停的服务无害，cam 页共用） */
+    voice_engine(0);   /* 退回首页即停语音链（stop 已停的服务无害） */
+    cam_stop();
     lv_screen_load_anim(scr_home, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
 }
 
@@ -1328,52 +1333,268 @@ static void goto_voice(lv_event_t *e)
     lv_screen_load_anim(scr_voice, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
 }
 
-/* ============ camera page ============ */
-static lv_obj_t *cam_label;
-static int cam_fd = -1;
+/* ============ camera page: rkisp selfpath 实时预览 ============
+ * 链路 = OV5695 → csi2-dphy1 → rkisp(/dev/video1 selfpath 640x480 NV12)。
+ * 板上 rkisp_v5：ISP 参数节点 /dev/video9 (META_OUTPUT) 必须先排入
+ * 一个 params 包并保持打开，否则 first_cfg 不下发、MI 永不写帧
+ * （详见 AGENTS.md 相机段）。采集线程只搬运 NV12，UI 定时器做
+ * NV12→XRGB 转换进 lv_canvas（LVGL 调用全在主线程）。 */
+#define CAM_W 640
+#define CAM_H 480
+#define CAM_NV12_SZ (CAM_W * CAM_H * 3 / 2)
 
-static void cam_probe(void)
+static lv_obj_t *cam_canvas, *cam_label;
+static uint32_t cam_argb[CAM_W * CAM_H];
+static unsigned char cam_nv12[2][CAM_NV12_SZ];
+static volatile int cam_slot;
+static volatile long cam_seq, cam_seq_shown, cam_frames, cam_fps;
+static uint64_t cam_t0;
+static pthread_t cam_thr;
+static volatile int cam_run, cam_started;
+static volatile int cam_fd = -1, cam_params_fd = -1;
+static void *cam_mm[4];
+static size_t cam_mm_len[4];
+static const char *cam_err;
+
+static inline int clampi(int v, int lo, int hi)
 {
-    const char *msg = "摄像头未就绪";
-    do {
-        cam_fd = open("/dev/video0", O_RDWR);
-        if (cam_fd < 0) { msg = "无法打开 /dev/video0"; break; }
-        struct v4l2_capability cap;
-        if (ioctl(cam_fd, VIDIOC_QUERYCAP, &cap) < 0) { msg = "QUERYCAP 失败"; break; }
-        static char info[128];
-        struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
-        ioctl(cam_fd, VIDIOC_G_FMT, &fmt);
-        snprintf(info, sizeof(info), "%s\n当前格式: %ux%u %s\n(预览功能开发中)",
-                 (const char *)cap.card, fmt.fmt.pix.width, fmt.fmt.pix.height,
-                 fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_NV12 ? "NV12" : "RAW");
-        msg = info;
-        close(cam_fd); cam_fd = -1;
-    } while (0);
-    lv_label_set_text(cam_label, msg);
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* ISP 参数包：全零即可让 first_cfg 下发默认寄存器（曝控制仍由 sensor 默认） */
+static int cam_feed_params(void)
+{
+    int fd = open("/dev/video9", O_RDWR);
+    if (fd < 0) return -1;
+    struct v4l2_format f;
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_META_OUTPUT;
+    f.fmt.meta.dataformat = v4l2_fourcc('R', 'K', '1', 'P');
+    ioctl(fd, VIDIOC_S_FMT, &f);
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_META_OUTPUT;
+    if (ioctl(fd, VIDIOC_G_FMT, &f) < 0 || !f.fmt.meta.buffersize) {
+        close(fd);
+        return -1;
+    }
+    unsigned sz = f.fmt.meta.buffersize;
+    struct v4l2_requestbuffers r;
+    memset(&r, 0, sizeof r);
+    r.count = 1;
+    r.type = V4L2_BUF_TYPE_META_OUTPUT;
+    r.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &r) < 0) { close(fd); return -1; }
+    void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return -1; }
+    memset(p, 0, sz);
+    struct v4l2_buffer b;
+    memset(&b, 0, sizeof b);
+    b.type = V4L2_BUF_TYPE_META_OUTPUT;
+    b.memory = V4L2_MEMORY_MMAP;
+    b.index = 0;
+    b.length = sz;
+    if (ioctl(fd, VIDIOC_QBUF, &b) < 0) { munmap(p, sz); close(fd); return -1; }
+    int t = V4L2_BUF_TYPE_META_OUTPUT;
+    if (ioctl(fd, VIDIOC_STREAMON, &t) < 0) { munmap(p, sz); close(fd); return -1; }
+    return fd;   /* 必须全程保持打开：关闭即撤掉 ISP 配置 */
+}
+
+static void cam_thread_cleanup(int fd, int pfd)
+{
+    int t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    ioctl(fd, VIDIOC_STREAMOFF, &t);
+    for (int i = 0; i < 4; i++)
+        if (cam_mm[i] && cam_mm[i] != MAP_FAILED) munmap(cam_mm[i], cam_mm_len[i]);
+    if (pfd >= 0) close(pfd);
+    close(fd);
+    cam_fd = -1;
+    cam_params_fd = -1;
+}
+
+static void *cam_thread(void *arg)
+{
+    (void)arg;
+    int fd = open("/dev/video1", O_RDWR);
+    if (fd < 0) { cam_err = "无法打开 /dev/video1"; return NULL; }
+    cam_fd = fd;
+    struct v4l2_format f;
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    f.fmt.pix_mp.width = CAM_W;
+    f.fmt.pix_mp.height = CAM_H;
+    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+    f.fmt.pix_mp.num_planes = 1;
+    if (ioctl(fd, VIDIOC_S_FMT, &f) < 0) {
+        cam_err = "S_FMT 失败";
+        close(fd); cam_fd = -1;
+        return NULL;
+    }
+    struct v4l2_requestbuffers r;
+    memset(&r, 0, sizeof r);
+    r.count = 4;
+    r.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    r.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &r) < 0 || r.count < 2) {
+        cam_err = "REQBUFS 失败";
+        close(fd); cam_fd = -1;
+        return NULL;
+    }
+    memset(cam_mm, 0, sizeof cam_mm);
+    for (unsigned i = 0; i < r.count; i++) {
+        struct v4l2_buffer b;
+        struct v4l2_plane pl[1];
+        memset(&b, 0, sizeof b);
+        memset(pl, 0, sizeof pl);
+        b.index = i;
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.length = 1;
+        b.m.planes = pl;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &b) < 0) continue;
+        cam_mm_len[i] = pl[0].length;
+        cam_mm[i] = mmap(NULL, pl[0].length, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, pl[0].m.mem_offset);
+        if (cam_mm[i] == MAP_FAILED) { cam_mm[i] = NULL; continue; }
+        pl[0].bytesused = 0;
+        if (ioctl(fd, VIDIOC_QBUF, &b) < 0) { /* 少一个也能跑 */ }
+    }
+    int pfd = cam_feed_params();
+    int t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(fd, VIDIOC_STREAMON, &t) < 0) {
+        cam_err = pfd >= 0 ? "STREAMON 失败" : "ISP 参数节点不可用";
+        cam_thread_cleanup(fd, pfd);
+        return NULL;
+    }
+    cam_frames = 0;
+    cam_t0 = now_ms();
+    while (cam_run) {
+        struct v4l2_buffer b;
+        struct v4l2_plane pl[1];
+        memset(&b, 0, sizeof b);
+        memset(pl, 0, sizeof pl);
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.length = 1;
+        b.m.planes = pl;
+        if (ioctl(fd, VIDIOC_DQBUF, &b) < 0) break;
+        if (b.index < 4 && cam_mm[b.index] && b.m.planes[0].bytesused >= CAM_NV12_SZ) {
+            int slot = 1 - cam_slot;
+            memcpy(cam_nv12[slot], cam_mm[b.index], CAM_NV12_SZ);
+            cam_slot = slot;
+            cam_seq++;
+            cam_frames++;
+        }
+        ioctl(fd, VIDIOC_QBUF, &b);
+    }
+    cam_thread_cleanup(fd, pfd);
+    return NULL;
+}
+
+static void cam_start(void)
+{
+    if (cam_started) return;
+    cam_started = 1;
+    cam_run = 1;
+    cam_err = NULL;
+    cam_seq_shown = -1;
+    pthread_create(&cam_thr, NULL, cam_thread, NULL);
+}
+
+static void cam_stop(void)
+{
+    if (!cam_started) return;
+    cam_run = 0;
+    int fd = cam_fd;
+    if (fd >= 0) {
+        int t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        ioctl(fd, VIDIOC_STREAMOFF, &t);   /* 唤醒阻塞的 DQBUF */
+    }
+    pthread_join(cam_thr, NULL);
+    cam_started = 0;
+}
+
+static void cam_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    static uint64_t last_fps_ms;
+    static long last_frames;
+    if (cam_err && cam_label) {
+        lv_label_set_text(cam_label, cam_err);
+        cam_err = NULL;
+        return;
+    }
+    if (cam_seq == cam_seq_shown) return;
+    cam_seq_shown = cam_seq;
+    int s = cam_slot;
+    const unsigned char *y = cam_nv12[s];
+    const unsigned char *uv = y + CAM_W * CAM_H;
+    uint32_t *dst = cam_argb;
+    for (int r = 0; r < CAM_H; r++) {
+        const unsigned char *yr = y + r * CAM_W;
+        const unsigned char *uvr = uv + (r >> 1) * CAM_W;
+        for (int c = 0; c < CAM_W; c++) {
+            int u = uvr[(c >> 1) << 1] - 128;
+            int v = uvr[((c >> 1) << 1) + 1] - 128;
+            int yy = yr[c];
+            int rr = (yy * 298 + 409 * v + 128) >> 8;
+            int gg = (yy * 298 - 100 * u - 208 * v + 128) >> 8;
+            int bb = (yy * 298 + 516 * u + 128) >> 8;
+            *dst++ = 0xFF000000u | (clampi(rr, 0, 255) << 16) |
+                     (clampi(gg, 0, 255) << 8) | clampi(bb, 0, 255);
+        }
+    }
+    lv_obj_invalidate(cam_canvas);
+    uint64_t now = now_ms();
+    if (now - last_fps_ms >= 500 && cam_label) {
+        cam_fps = (cam_frames - last_frames) * 1000 / (now - last_fps_ms);
+        last_fps_ms = now;
+        last_frames = cam_frames;
+        static char txt[64];
+        snprintf(txt, sizeof(txt), "OV5695  %d×%d NV12  %ld fps",
+                 CAM_W, CAM_H, cam_fps);
+        lv_label_set_text(cam_label, txt);
+    }
 }
 
 static void cam_build(void)
 {
     scr_cam = lv_obj_create(NULL);
     style_base(scr_cam, NULL);
-    topbar_build(scr_cam, "摄像头");
-    lv_obj_t *box = lv_obj_create(scr_cam);
-    lv_obj_set_size(box, 740, 330);
-    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, 96);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x0b0e12), 0);
-    lv_obj_set_style_border_color(box, COL_ACCENT2, 0);
-    lv_obj_set_style_border_width(box, 2, 0);
-    lv_obj_set_style_radius(box, 16, 0);
-    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-    cam_label = label_cn(box, "检测中…");
-    lv_obj_center(cam_label);
+    /* 无标题栏：返回键右上（与语音页一致），预览 640x480 居中占满高度 */
+    lv_obj_t *back = lv_button_create(scr_cam);
+    lv_obj_set_size(back, 96, 56);
+    lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -12, 12);
+    lv_obj_set_style_bg_color(back, COL_CARD, 0);
+    lv_obj_set_style_radius(back, 14, 0);
+    lv_obj_set_style_border_color(back, COL_DIM, 0);
+    lv_obj_set_style_border_width(back, 2, 0);
+    lv_obj_t *bl = lv_label_create(back);
+    lv_label_set_text(bl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(bl, COL_TEXT, 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(back, back_to_home, LV_EVENT_CLICKED, NULL);
+
+    cam_canvas = lv_canvas_create(scr_cam);
+    lv_canvas_set_buffer(cam_canvas, cam_argb, CAM_W, CAM_H,
+                         LV_COLOR_FORMAT_XRGB8888);
+    lv_obj_set_pos(cam_canvas, (HRES - CAM_W) / 2, 0);
+    memset(cam_argb, 0x10, sizeof(cam_argb));
+
+    cam_label = label_cn(scr_cam, "摄像头启动中…");
+    lv_obj_set_pos(cam_label, (HRES - CAM_W) / 2 + 12, VRES - 40);
+    lv_obj_set_style_text_color(cam_label, lv_color_hex(0xaebac5), 0);
+    lv_obj_set_style_bg_color(cam_label, lv_color_hex(0x101418), 0);
+    lv_obj_set_style_bg_opa(cam_label, LV_OPA_80, 0);
+    lv_obj_set_style_pad_hor(cam_label, 8, 0);
+
+    lv_timer_create(cam_timer_cb, 33, NULL);
 }
 
 static void goto_cam(lv_event_t *e)
 {
     (void)e;
+    cam_start();
     lv_screen_load_anim(scr_cam, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
-    cam_probe();
 }
 
 /* ---------------- UI fifo (va -> robot-ui) ---------------- */
